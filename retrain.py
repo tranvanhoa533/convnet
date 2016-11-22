@@ -83,7 +83,10 @@ from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
 
 
+import 
+
 import struct
+import sklearn as sk
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -981,14 +984,20 @@ def main(_):
       sess, image_lists, FLAGS.test_batch_size, 'testing',
       FLAGS.bottleneck_dir, FLAGS.image_dir, jpeg_data_tensor,
       bottleneck_tensor)
-  test_accuracy = sess.run(
-      evaluation_step,
+
+  y_p = tf.argmax(final_tensor, 1)
+  test_accuracy , y_pred = sess.run(
+      [evaluation_step, y_p],
       feed_dict={bottleneck_input: test_bottlenecks,
                  ground_truth_input: test_ground_truth})
   print('Final test accuracy = %.1f%%' % (test_accuracy * 100))
 
-  print(tf_confusion_metrics(final_tensor,tf.placeholder("float", [None, len(image_lists.keys())]) ,sess, feed_dict={bottleneck_input: test_bottlenecks,
-                 ground_truth_input: test_ground_truth}))
+  y_true = np.argmax(test_ground_truth,1)
+  print("Precision", sk.metrics.precision_score(y_true, y_pred))
+  print("Recall", sk.metrics.recall_score(y_true, y_pred))
+  print("f1_score", sk.metrics.f1_score(y_true, y_pred))
+
+  #print(tf_confusion_metrics(final_tensor,tf.placeholder("float", [None, len(image_lists.keys())]) ,sess, feed_dict={bottleneck_input: test_bottlenecks, ground_truth_input: test_ground_truth}))
 
   # Write out the trained graph and labels with the weights stored as constants.
   output_graph_def = graph_util.convert_variables_to_constants(
