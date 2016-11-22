@@ -14,49 +14,62 @@
 # ==============================================================================
 """Simple transfer learning with an Inception v3 architecture model which
 displays summaries in TensorBoard.
+
 This example shows how to take a Inception v3 architecture model trained on
 ImageNet images, and train a new top layer that can recognize other classes of
 images.
+
 The top layer receives as input a 2048-dimensional vector for each image. We
 train a softmax layer on top of this representation. Assuming the softmax layer
 contains N labels, this corresponds to learning N + 2048*N model parameters
 corresponding to the learned biases and weights.
+
 Here's an example, which assumes you have a folder containing class-named
 subfolders, each full of images for each label. The example folder flower_photos
 should have a structure like this:
+
 ~/flower_photos/daisy/photo1.jpg
 ~/flower_photos/daisy/photo2.jpg
 ...
 ~/flower_photos/rose/anotherphoto77.jpg
 ...
 ~/flower_photos/sunflower/somepicture.jpg
+
 The subfolder names are important, since they define what label is applied to
 each image, but the filenames themselves don't matter. Once your images are
 prepared, you can run the training with a command like this:
+
 bazel build third_party/tensorflow/examples/image_retraining:retrain && \
 bazel-bin/third_party/tensorflow/examples/image_retraining/retrain \
 --image_dir ~/flower_photos
+
 You can replace the image_dir argument with any folder containing subfolders of
 images. The label for each image is taken from the name of the subfolder it's
 in.
+
 This produces a new model file that can be loaded and run by any TensorFlow
 program, for example the label_image sample code.
+
+
 To use with TensorBoard:
+
 By default, this script will log summaries to /tmp/retrain_logs directory
+
 Visualize the summaries with this command:
+
 tensorboard --logdir /tmp/retrain_logs
+
 """
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import argparse
 from datetime import datetime
+import glob
 import hashlib
 import os.path
 import random
 import re
-import struct
 import sys
 import tarfile
 
@@ -69,22 +82,82 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
 
-FLAGS = None
+
+import struct
+
+FLAGS = tf.app.flags.FLAGS
 
 # Input and output file flags.
+tf.app.flags.DEFINE_string('image_dir', '',
+                           """Path to folders of labeled images.""")
+tf.app.flags.DEFINE_string('output_graph', '/tmp/output_graph.pb',
+                           """Where to save the trained graph.""")
+tf.app.flags.DEFINE_string('output_labels', '/tmp/output_labels.txt',
+                           """Where to save the trained graph's labels.""")
+tf.app.flags.DEFINE_string('summaries_dir', '/tmp/retrain_logs',
+                          """Where to save summary logs for TensorBoard.""")
 
 # Details of the training configuration.
+tf.app.flags.DEFINE_integer('how_many_training_steps', 4000,
+                            """How many training steps to run before ending.""")
+tf.app.flags.DEFINE_float('learning_rate', 0.01,
+                          """How large a learning rate to use when training.""")
+tf.app.flags.DEFINE_integer(
+    'testing_percentage', 10,
+    """What percentage of images to use as a test set.""")
+tf.app.flags.DEFINE_integer(
+    'validation_percentage', 10,
+    """What percentage of images to use as a validation set.""")
+tf.app.flags.DEFINE_integer('eval_step_interval', 10,
+                            """How often to evaluate the training results.""")
+tf.app.flags.DEFINE_integer('train_batch_size', 100,
+                            """How many images to train on at a time.""")
+tf.app.flags.DEFINE_integer('test_batch_size', 500,
+                            """How many images to test on at a time. This"""
+                            """ test set is only used infrequently to verify"""
+                            """ the overall accuracy of the model.""")
+tf.app.flags.DEFINE_integer(
+    'validation_batch_size', 100,
+    """How many images to use in an evaluation batch. This validation set is"""
+    """ used much more often than the test set, and is an early indicator of"""
+    """ how accurate the model is during training.""")
 
 # File-system cache locations.
+tf.app.flags.DEFINE_string('model_dir', '/tmp/imagenet',
+                           """Path to classify_image_graph_def.pb, """
+                           """imagenet_synset_to_human_label_map.txt, and """
+                           """imagenet_2012_challenge_label_map_proto.pbtxt.""")
+tf.app.flags.DEFINE_string(
+    'bottleneck_dir', '/tmp/bottleneck',
+    """Path to cache bottleneck layer values as files.""")
+tf.app.flags.DEFINE_string('final_tensor_name', 'final_result',
+                           """The name of the output classification layer in"""
+                           """ the retrained graph.""")
 
 # Controls the distortions used during training.
+tf.app.flags.DEFINE_boolean(
+    'flip_left_right', False,
+    """Whether to randomly flip half of the training images horizontally.""")
+tf.app.flags.DEFINE_integer(
+    'random_crop', 0,
+    """A percentage determining how much of a margin to randomly crop off the"""
+    """ training images.""")
+tf.app.flags.DEFINE_integer(
+    'random_scale', 0,
+    """A percentage determining how much to randomly scale up the size of the"""
+    """ training images by.""")
+tf.app.flags.DEFINE_integer(
+    'random_brightness', 0,
+    """A percentage determining how much to randomly multiply the training"""
+    """ image input pixels up or down by.""")
 
 # These are all parameters that are tied to the particular model architecture
 # we're using for Inception v3. These include things like tensor names and their
 # sizes. If you want to adapt this script to work with another model, you will
 # need to update these to reflect the values in the network you're using.
 # pylint: disable=line-too-long
-DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
+#DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
+DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception_resnet_v2_2016_08_30.tar.gz'
 # pylint: enable=line-too-long
 BOTTLENECK_TENSOR_NAME = 'pool_3/_reshape:0'
 BOTTLENECK_TENSOR_SIZE = 2048
@@ -98,13 +171,16 @@ MAX_NUM_IMAGES_PER_CLASS = 2 ** 27 - 1  # ~134M
 
 def create_image_lists(image_dir, testing_percentage, validation_percentage):
   """Builds a list of training images from the file system.
+
   Analyzes the sub folders in the image directory, splits them into stable
   training, testing, and validation sets, and returns a data structure
   describing the lists of images for each label and their paths.
+
   Args:
     image_dir: String path to a folder containing subfolders of images.
     testing_percentage: Integer percentage of the images to reserve for tests.
     validation_percentage: Integer percentage of images reserved for validation.
+
   Returns:
     A dictionary containing an entry for each label subfolder, with images split
     into training, testing, and validation sets within each label.
@@ -113,7 +189,7 @@ def create_image_lists(image_dir, testing_percentage, validation_percentage):
     print("Image directory '" + image_dir + "' not found.")
     return None
   result = {}
-  sub_dirs = [x[0] for x in gfile.Walk(image_dir)]
+  sub_dirs = [x[0] for x in os.walk(image_dir)]
   # The root directory comes first, so skip it.
   is_root_dir = True
   for sub_dir in sub_dirs:
@@ -128,7 +204,7 @@ def create_image_lists(image_dir, testing_percentage, validation_percentage):
     print("Looking for images in '" + dir_name + "'")
     for extension in extensions:
       file_glob = os.path.join(image_dir, dir_name, '*.' + extension)
-      file_list.extend(gfile.Glob(file_glob))
+      file_list.extend(glob.glob(file_glob))
     if not file_list:
       print('No files found')
       continue
@@ -177,6 +253,7 @@ def create_image_lists(image_dir, testing_percentage, validation_percentage):
 
 def get_image_path(image_lists, label_name, index, image_dir, category):
   """"Returns a path to an image for a label at the given index.
+
   Args:
     image_lists: Dictionary of training images for each label.
     label_name: Label string we want to get an image for.
@@ -186,8 +263,10 @@ def get_image_path(image_lists, label_name, index, image_dir, category):
     images.
     category: Name string of set to pull images from - training, testing, or
     validation.
+
   Returns:
     File system path string to an image that meets the requested parameters.
+
   """
   if label_name not in image_lists:
     tf.logging.fatal('Label does not exist %s.', label_name)
@@ -208,6 +287,7 @@ def get_image_path(image_lists, label_name, index, image_dir, category):
 def get_bottleneck_path(image_lists, label_name, index, bottleneck_dir,
                         category):
   """"Returns a path to a bottleneck file for a label at the given index.
+
   Args:
     image_lists: Dictionary of training images for each label.
     label_name: Label string we want to get an image for.
@@ -216,6 +296,7 @@ def get_bottleneck_path(image_lists, label_name, index, bottleneck_dir,
     bottleneck_dir: Folder string holding cached files of bottleneck values.
     category: Name string of set to pull images from - training, testing, or
     validation.
+
   Returns:
     File system path string to an image that meets the requested parameters.
   """
@@ -225,6 +306,7 @@ def get_bottleneck_path(image_lists, label_name, index, bottleneck_dir,
 
 def create_inception_graph():
   """"Creates a graph from saved GraphDef file and returns a Graph object.
+
   Returns:
     Graph holding the trained Inception network, and various tensors we'll be
     manipulating.
@@ -245,11 +327,13 @@ def create_inception_graph():
 def run_bottleneck_on_image(sess, image_data, image_data_tensor,
                             bottleneck_tensor):
   """Runs inference on an image to extract the 'bottleneck' summary layer.
+
   Args:
     sess: Current active TensorFlow Session.
     image_data: String of raw JPEG data.
     image_data_tensor: Input data layer in the graph.
     bottleneck_tensor: Layer before the final softmax.
+
   Returns:
     Numpy array of bottleneck values.
   """
@@ -262,6 +346,7 @@ def run_bottleneck_on_image(sess, image_data, image_data_tensor,
 
 def maybe_download_and_extract():
   """Download and extract model tar file.
+
   If the pretrained model we're using doesn't already exist, this function
   downloads it from the TensorFlow.org website and unpacks it into a directory.
   """
@@ -289,6 +374,7 @@ def maybe_download_and_extract():
 
 def ensure_dir_exists(dir_name):
   """Makes sure the folder exists on disk.
+
   Args:
     dir_name: Path string to the folder we want to create.
   """
@@ -298,9 +384,11 @@ def ensure_dir_exists(dir_name):
 
 def write_list_of_floats_to_file(list_of_floats , file_path):
   """Writes a given list of floats to a binary file.
+
   Args:
     list_of_floats: List of floats we want to write to a file.
     file_path: Path to a file where list of floats will be stored.
+
   """
 
   s = struct.pack('d' * BOTTLENECK_TENSOR_SIZE, *list_of_floats)
@@ -310,10 +398,12 @@ def write_list_of_floats_to_file(list_of_floats , file_path):
 
 def read_list_of_floats_from_file(file_path):
   """Reads list of floats from a given file.
+
   Args:
     file_path: Path to a file where list of floats was stored.
   Returns:
     Array of bottleneck values (list of floats).
+
   """
 
   with open(file_path, 'rb') as f:
@@ -328,8 +418,10 @@ def get_or_create_bottleneck(sess, image_lists, label_name, index, image_dir,
                              category, bottleneck_dir, jpeg_data_tensor,
                              bottleneck_tensor):
   """Retrieves or calculates bottleneck values for an image.
+
   If a cached version of the bottleneck data exists on-disk, return that,
   otherwise calculate the data and save it to disk for future use.
+
   Args:
     sess: The current active TensorFlow Session.
     image_lists: Dictionary of training images for each label.
@@ -343,6 +435,7 @@ def get_or_create_bottleneck(sess, image_lists, label_name, index, image_dir,
     bottleneck_dir: Folder string holding cached files of bottleneck values.
     jpeg_data_tensor: The tensor to feed loaded jpeg data into.
     bottleneck_tensor: The output tensor for the bottleneck values.
+
   Returns:
     Numpy array of values produced by the bottleneck layer for the image.
   """
@@ -375,12 +468,14 @@ def get_or_create_bottleneck(sess, image_lists, label_name, index, image_dir,
 def cache_bottlenecks(sess, image_lists, image_dir, bottleneck_dir,
                       jpeg_data_tensor, bottleneck_tensor):
   """Ensures all the training, testing, and validation bottlenecks are cached.
+
   Because we're likely to read the same image multiple times (if there are no
   distortions applied during training) it can speed things up a lot if we
   calculate the bottleneck layer values once for each image during
   preprocessing, and then just read those cached values repeatedly during
   training. Here we go through all the images we've found, calculate those
   values, and save them off.
+
   Args:
     sess: The current active TensorFlow Session.
     image_lists: Dictionary of training images for each label.
@@ -389,6 +484,7 @@ def cache_bottlenecks(sess, image_lists, image_dir, bottleneck_dir,
     bottleneck_dir: Folder string holding cached files of bottleneck values.
     jpeg_data_tensor: Input tensor for jpeg data from file.
     bottleneck_tensor: The penultimate output layer of the graph.
+
   Returns:
     Nothing.
   """
@@ -410,9 +506,11 @@ def get_random_cached_bottlenecks(sess, image_lists, how_many, category,
                                   bottleneck_dir, image_dir, jpeg_data_tensor,
                                   bottleneck_tensor):
   """Retrieves bottleneck values for cached images.
+
   If no distortions are being applied, this function can retrieve the cached
   bottleneck values directly from disk for images. It picks a random set of
   images from the specified category.
+
   Args:
     sess: Current TensorFlow Session.
     image_lists: Dictionary of training images for each label.
@@ -424,6 +522,7 @@ def get_random_cached_bottlenecks(sess, image_lists, how_many, category,
     images.
     jpeg_data_tensor: The layer to feed jpeg image data into.
     bottleneck_tensor: The bottleneck output layer of the CNN graph.
+
   Returns:
     List of bottleneck arrays and their corresponding ground truths.
   """
@@ -449,11 +548,13 @@ def get_random_distorted_bottlenecks(
     sess, image_lists, how_many, category, image_dir, input_jpeg_tensor,
     distorted_image, resized_input_tensor, bottleneck_tensor):
   """Retrieves bottleneck values for training images, after distortions.
+
   If we're training with distortions like crops, scales, or flips, we have to
   recalculate the full model for every image, and so we can't use cached
   bottleneck values. Instead we find random images for the requested category,
   run them through the distortion graph, and then the full graph to get the
   bottleneck results for each.
+
   Args:
     sess: Current TensorFlow Session.
     image_lists: Dictionary of training images for each label.
@@ -466,6 +567,7 @@ def get_random_distorted_bottlenecks(
     distorted_image: The output node of the distortion graph.
     resized_input_tensor: The input node of the recognition graph.
     bottleneck_tensor: The bottleneck output layer of the CNN graph.
+
   Returns:
     List of bottleneck arrays and their corresponding ground truths.
   """
@@ -499,12 +601,14 @@ def get_random_distorted_bottlenecks(
 def should_distort_images(flip_left_right, random_crop, random_scale,
                           random_brightness):
   """Whether any distortions are enabled, from the input flags.
+
   Args:
     flip_left_right: Boolean whether to randomly mirror images horizontally.
     random_crop: Integer percentage setting the total margin used around the
     crop box.
     random_scale: Integer percentage of how much to vary the scale by.
     random_brightness: Integer range to randomly multiply the pixel values by.
+
   Returns:
     Boolean value indicating whether any distortions should be applied.
   """
@@ -515,18 +619,22 @@ def should_distort_images(flip_left_right, random_crop, random_scale,
 def add_input_distortions(flip_left_right, random_crop, random_scale,
                           random_brightness):
   """Creates the operations to apply the specified distortions.
+
   During training it can help to improve the results if we run the images
   through simple distortions like crops, scales, and flips. These reflect the
   kind of variations we expect in the real world, and so can help train the
   model to cope with natural data more effectively. Here we take the supplied
   parameters and construct a network of operations to apply them to an image.
+
   Cropping
   ~~~~~~~~
+
   Cropping is done by placing a bounding box at a random position in the full
   image. The cropping parameter controls the size of that box relative to the
   input image. If it's zero, then the box is the same size as the input and no
   cropping is performed. If the value is 50%, then the crop box will be half the
   width and height of the input. In a diagram it looks like this:
+
   <       width         >
   +---------------------+
   |                     |
@@ -540,13 +648,16 @@ def add_input_distortions(flip_left_right, random_crop, random_scale,
   |                     |
   |                     |
   +---------------------+
+
   Scaling
   ~~~~~~~
+
   Scaling is a lot like cropping, except that the bounding box is always
   centered and its size varies randomly within the given range. For example if
   the scale percentage is zero, then the bounding box is the same size as the
   input and no scaling is applied. If it's 50%, then the bounding box will be in
   a random range between half the width and height and full size.
+
   Args:
     flip_left_right: Boolean whether to randomly mirror images horizontally.
     random_crop: Integer percentage setting the total margin used around the
@@ -554,6 +665,7 @@ def add_input_distortions(flip_left_right, random_crop, random_scale,
     random_scale: Integer percentage of how much to vary the scale by.
     random_brightness: Integer range to randomly multiply the pixel values by.
     graph.
+
   Returns:
     The jpeg input layer and the distorted result tensor.
   """
@@ -571,7 +683,7 @@ def add_input_distortions(flip_left_right, random_crop, random_scale,
   scale_value = tf.mul(margin_scale_value, resize_scale_value)
   precrop_width = tf.mul(scale_value, MODEL_INPUT_WIDTH)
   precrop_height = tf.mul(scale_value, MODEL_INPUT_HEIGHT)
-  precrop_shape = tf.stack([precrop_height, precrop_width])
+  precrop_shape = tf.pack([precrop_height, precrop_width])
   precrop_shape_as_int = tf.cast(precrop_shape, dtype=tf.int32)
   precropped_image = tf.image.resize_bilinear(decoded_image_4d,
                                               precrop_shape_as_int)
@@ -593,31 +705,35 @@ def add_input_distortions(flip_left_right, random_crop, random_scale,
   return jpeg_data, distort_result
 
 
-def variable_summaries(var):
+def variable_summaries(var, name):
   """Attach a lot of summaries to a Tensor (for TensorBoard visualization)."""
   with tf.name_scope('summaries'):
     mean = tf.reduce_mean(var)
-    tf.summary.scalar('mean', mean)
+    tf.scalar_summary('mean/' + name, mean)
     with tf.name_scope('stddev'):
       stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
-    tf.summary.scalar('stddev', stddev)
-    tf.summary.scalar('max', tf.reduce_max(var))
-    tf.summary.scalar('min', tf.reduce_min(var))
-    tf.summary.histogram('histogram', var)
+    tf.scalar_summary('stddev/' + name, stddev)
+    tf.scalar_summary('max/' + name, tf.reduce_max(var))
+    tf.scalar_summary('min/' + name, tf.reduce_min(var))
+    tf.histogram_summary(name, var)
 
 
 def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor):
   """Adds a new softmax and fully-connected layer for training.
+
   We need to retrain the top layer to identify our new classes, so this function
   adds the right operations to the graph, along with some variables to hold the
   weights, and then sets up all the gradients for the backward pass.
+
   The set up for the softmax and fully-connected layers is based on:
   https://tensorflow.org/versions/master/tutorials/mnist/beginners/index.html
+
   Args:
     class_count: Integer of how many categories of things we're trying to
     recognize.
     final_tensor_name: Name string for the new final node that produces results.
     bottleneck_tensor: The output of the main CNN graph.
+
   Returns:
     The tensors for the training and cross entropy results, and tensors for the
     bottleneck input and ground truth input.
@@ -637,23 +753,23 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor):
   with tf.name_scope(layer_name):
     with tf.name_scope('weights'):
       layer_weights = tf.Variable(tf.truncated_normal([BOTTLENECK_TENSOR_SIZE, class_count], stddev=0.001), name='final_weights')
-      variable_summaries(layer_weights)
+      variable_summaries(layer_weights, layer_name + '/weights')
     with tf.name_scope('biases'):
       layer_biases = tf.Variable(tf.zeros([class_count]), name='final_biases')
-      variable_summaries(layer_biases)
+      variable_summaries(layer_biases, layer_name + '/biases')
     with tf.name_scope('Wx_plus_b'):
       logits = tf.matmul(bottleneck_input, layer_weights) + layer_biases
-      tf.summary.histogram('pre_activations', logits)
+      tf.histogram_summary(layer_name + '/pre_activations', logits)
 
   final_tensor = tf.nn.softmax(logits, name=final_tensor_name)
-  tf.summary.histogram('activations', final_tensor)
+  tf.histogram_summary(final_tensor_name + '/activations', final_tensor)
 
   with tf.name_scope('cross_entropy'):
     cross_entropy = tf.nn.softmax_cross_entropy_with_logits(
       logits, ground_truth_input)
     with tf.name_scope('total'):
       cross_entropy_mean = tf.reduce_mean(cross_entropy)
-  tf.summary.scalar('cross_entropy', cross_entropy_mean)
+    tf.scalar_summary('cross entropy', cross_entropy_mean)
 
   with tf.name_scope('train'):
     train_step = tf.train.GradientDescentOptimizer(FLAGS.learning_rate).minimize(
@@ -665,10 +781,12 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor):
 
 def add_evaluation_step(result_tensor, ground_truth_tensor):
   """Inserts the operations we need to evaluate the accuracy of our results.
+
   Args:
     result_tensor: The new final node that produces results.
     ground_truth_tensor: The node we feed ground truth data
     into.
+
   Returns:
     Nothing.
   """
@@ -678,13 +796,11 @@ def add_evaluation_step(result_tensor, ground_truth_tensor):
         tf.argmax(ground_truth_tensor, 1))
     with tf.name_scope('accuracy'):
       evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-  tf.summary.scalar('accuracy', evaluation_step)
+    tf.scalar_summary('accuracy', evaluation_step)
   return evaluation_step
 
-
-
 def tf_confusion_metrics(model, actual_classes, session, feed_dict):
-      predictions = tf.argmax(model, 1)
+  predictions = tf.argmax(model, 1)
   actuals = tf.argmax(actual_classes, 1)
 
   ones_like_actuals = tf.ones_like(actuals)
@@ -748,12 +864,10 @@ def tf_confusion_metrics(model, actual_classes, session, feed_dict):
   
   f1_score = (2 * (precision * recall)) / (precision + recall)
   
-  print 'Precision = ', precision
-  print 'Recall = ', recall
-  print 'F1 Score = ', f1_score
-  print 'Accuracy = ', accuracy
-
-
+  print('Precision = ', precision)
+  print('Recall = ', recall)
+  print('F1 Score = ', f1_score)
+  print('Accuracy = ', accuracy)
 
 def main(_):
   # Setup the directory we'll write summaries to for TensorBoard
@@ -805,13 +919,13 @@ def main(_):
   evaluation_step = add_evaluation_step(final_tensor, ground_truth_input)
 
   # Merge all the summaries and write them out to /tmp/retrain_logs (by default)
-  merged = tf.summary.merge_all()
+  merged = tf.merge_all_summaries()
   train_writer = tf.train.SummaryWriter(FLAGS.summaries_dir + '/train',
                                         sess.graph)
   validation_writer = tf.train.SummaryWriter(FLAGS.summaries_dir + '/validation')
 
   # Set up all our weights to their initial default values.
-  init = tf.global_variables_initializer()
+  init = tf.initialize_all_variables()
   sess.run(init)
 
   # Run the training for as many cycles as requested on the command line.
@@ -873,8 +987,8 @@ def main(_):
                  ground_truth_input: test_ground_truth})
   print('Final test accuracy = %.1f%%' % (test_accuracy * 100))
 
-  print tf_confusion_metrics(final_tensor,tf.placeholder("float", [None, len(image_lists.keys())]) ,sess, feed_dict={bottleneck_input: test_bottlenecks,
-                 ground_truth_input: test_ground_truth})
+  print(tf_confusion_metrics(final_tensor,tf.placeholder("float", [None, len(image_lists.keys())]) ,sess, feed_dict={bottleneck_input: test_bottlenecks,
+                 ground_truth_input: test_ground_truth}))
 
   # Write out the trained graph and labels with the weights stored as constants.
   output_graph_def = graph_util.convert_variables_to_constants(
@@ -886,144 +1000,4 @@ def main(_):
 
 
 if __name__ == '__main__':
-  parser = argparse.ArgumentParser()
-  parser.add_argument(
-      '--image_dir',
-      type=str,
-      default='',
-      help='Path to folders of labeled images.'
-  )
-  parser.add_argument(
-      '--output_graph',
-      type=str,
-      default='/tmp/output_graph.pb',
-      help='Where to save the trained graph.'
-  )
-  parser.add_argument(
-      '--output_labels',
-      type=str,
-      default='/tmp/output_labels.txt',
-      help='Where to save the trained graph\'s labels.'
-  )
-  parser.add_argument(
-      '--summaries_dir',
-      type=str,
-      default='/tmp/retrain_logs',
-      help='Where to save summary logs for TensorBoard.'
-  )
-  parser.add_argument(
-      '--how_many_training_steps',
-      type=int,
-      default=4000,
-      help='How many training steps to run before ending.'
-  )
-  parser.add_argument(
-      '--learning_rate',
-      type=float,
-      default=0.01,
-      help='How large a learning rate to use when training.'
-  )
-  parser.add_argument(
-      '--testing_percentage',
-      type=int,
-      default=10,
-      help='What percentage of images to use as a test set.'
-  )
-  parser.add_argument(
-      '--validation_percentage',
-      type=int,
-      default=10,
-      help='What percentage of images to use as a validation set.'
-  )
-  parser.add_argument(
-      '--eval_step_interval',
-      type=int,
-      default=10,
-      help='How often to evaluate the training results.'
-  )
-  parser.add_argument(
-      '--train_batch_size',
-      type=int,
-      default=100,
-      help='How many images to train on at a time.'
-  )
-  parser.add_argument(
-      '--test_batch_size',
-      type=int,
-      default=500,
-      help="""\
-      How many images to test on at a time. This test set is only used
-      infrequently to verify the overall accuracy of the model.\
-      """
-  )
-  parser.add_argument(
-      '--validation_batch_size',
-      type=int,
-      default=100,
-      help="""\
-      How many images to use in an evaluation batch. This validation set is
-      used much more often than the test set, and is an early indicator of how
-      accurate the model is during training.\
-      """
-  )
-  parser.add_argument(
-      '--model_dir',
-      type=str,
-      default='/tmp/imagenet',
-      help="""\
-      Path to classify_image_graph_def.pb,
-      imagenet_synset_to_human_label_map.txt, and
-      imagenet_2012_challenge_label_map_proto.pbtxt.\
-      """
-  )
-  parser.add_argument(
-      '--bottleneck_dir',
-      type=str,
-      default='/tmp/bottleneck',
-      help='Path to cache bottleneck layer values as files.'
-  )
-  parser.add_argument(
-      '--final_tensor_name',
-      type=str,
-      default='final_result',
-      help="""\
-      The name of the output classification layer in the retrained graph.\
-      """
-  )
-  parser.add_argument(
-      '--flip_left_right',
-      default=False,
-      help="""\
-      Whether to randomly flip half of the training images horizontally.\
-      """,
-      action='store_true'
-  )
-  parser.add_argument(
-      '--random_crop',
-      type=int,
-      default=0,
-      help="""\
-      A percentage determining how much of a margin to randomly crop off the
-      training images.\
-      """
-  )
-  parser.add_argument(
-      '--random_scale',
-      type=int,
-      default=0,
-      help="""\
-      A percentage determining how much to randomly scale up the size of the
-      training images by.\
-      """
-  )
-  parser.add_argument(
-      '--random_brightness',
-      type=int,
-      default=0,
-      help="""\
-      A percentage determining how much to randomly multiply the training image
-      input pixels up or down by.\
-      """
-  )
-  FLAGS, unparsed = parser.parse_known_args()
-  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
+  tf.app.run()
