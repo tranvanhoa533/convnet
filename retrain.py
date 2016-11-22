@@ -82,9 +82,6 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
 
-
-import 
-
 import struct
 import sklearn as sk
 
